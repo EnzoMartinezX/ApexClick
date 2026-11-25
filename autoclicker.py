@@ -382,7 +382,7 @@ class ChronometerCard(ctk.CTkFrame):
 
 
 # =============================================================================
-# Main Application: Spacious 5-Page Neon Dashboard (v4)
+# Main Application: Spacious 5-Page Neon Dashboard (v2)
 # =============================================================================
 class AutoclickerApp(ctk.CTk):
     NAV_ITEMS = [
@@ -524,7 +524,7 @@ class AutoclickerApp(ctk.CTk):
         ).pack(side="left")
         ctk.CTkLabel(
             b_row,
-            text="v4",
+            text="v2",
             font=("Consolas", 10, "bold"),
             text_color="#FFFFFF",
             fg_color=COLORS["neon_blue"],

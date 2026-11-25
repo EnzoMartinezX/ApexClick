@@ -1,4 +1,4 @@
-# ApexClick
+# ApexClick v2
 
 Suite multifunción de autoclicker, múltiples zonas holográficas y grabador/editor de macros en Python (`customtkinter` + `pynput`) con estética **Negro Obsidiana y Azul Neón**.
 

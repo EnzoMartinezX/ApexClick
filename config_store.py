@@ -52,7 +52,7 @@ DEFAULT_STATE: Dict[str, Any] = {
 
 def load_config_file(path: str | None = None) -> Dict[str, Any]:
     cfg_path = path or get_config_path()
-    base = {"version": 4, "last_state": dict(DEFAULT_STATE), "profiles": {}}
+    base = {"version": 2, "last_state": dict(DEFAULT_STATE), "profiles": {}}
     if not os.path.exists(cfg_path):
         return base
     try:
@@ -66,7 +66,7 @@ def load_config_file(path: str | None = None) -> Dict[str, Any]:
         profiles = raw.get("profiles", {})
         if not isinstance(profiles, dict):
             profiles = {}
-        return {"version": 4, "last_state": merged_state, "profiles": profiles}
+        return {"version": 2, "last_state": merged_state, "profiles": profiles}
     except Exception:
         return base
 
@@ -74,7 +74,7 @@ def load_config_file(path: str | None = None) -> Dict[str, Any]:
 def save_config_file(data: Dict[str, Any], path: str | None = None) -> None:
     cfg_path = path or get_config_path()
     payload = {
-        "version": 4,
+        "version": 2,
         "last_state": data.get("last_state", dict(DEFAULT_STATE)),
         "profiles": data.get("profiles", {}),
     }
