@@ -8,8 +8,8 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo Building executable...
-pyinstaller --noconsole --onefile --name "Autoclicker" autoclicker.py
+echo Building ApexClick executable...
+pyinstaller --noconsole --onefile --clean --workpath "%TEMP%\apexclick_build" --distpath "dist" --name "ApexClick" --icon "neon_icon.ico" --add-data "neon_icon.ico;." autoclicker.py
 if %ERRORLEVEL% NEQ 0 (
     echo Error building executable.
     pause
@@ -18,5 +18,5 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo.
 echo Build complete!
-echo You can find the executable in the "dist" folder.
+echo You can find ApexClick.exe in the "dist" folder.
 pause
