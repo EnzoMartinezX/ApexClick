@@ -21,8 +21,9 @@ Suite multifunción de autoclicker, múltiples zonas holográficas y grabador/ed
    - **Cuenta regresiva** configurable antes de iniciar.
    - **Filtro por ventana activa**: auto-pausa al cambiar de app y reanuda al volver.
    - **Failsafe de esquina** `(0, 0)` y **sonidos de aviso** suaves opcionales.
-5. **💾 Perfiles y Atajos**
+5. **💾 Perfiles, Atajos e Idioma**
    - Guardado automático en `config.json` y **perfiles/presets** nombrados.
+   - Selector de idioma en vivo (**Español** por defecto / **English**) sin reiniciar la app.
    - Atajos globales personalizables (`F6`, `F7`, `F8` por defecto) y **Modo Mini-HUD flotante** con contador de ciclos/macros y transiciones sin parpadeo.
 
 ## Instalación y Uso

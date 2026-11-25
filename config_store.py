@@ -22,6 +22,7 @@ def get_macros_dir() -> str:
 
 
 DEFAULT_STATE: Dict[str, Any] = {
+    "language": "es",
     "input_type": "mouse",
     "action_mode": "hold",
     "mouse_button": "left",
