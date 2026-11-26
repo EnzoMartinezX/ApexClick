@@ -13,9 +13,10 @@ Suite multifunción de autoclicker, múltiples zonas holográficas y grabador/ed
    - Soporte para **múltiples zonas numeradas** (`#1`, `#2`, `#3`...) con modos **Mouse real**, **Ambos (Real + Zonas)** y **Solo zonas fijas**.
    - Clicks atómicos a nivel kernel (`SendInput`) con soporte multi-monitor y *click-through* automático al iniciar.
 3. **🎬 Macros**
-   - Grabación selectiva de **Teclado**, **Mouse (Clicks/Scroll)** y **Movimientos**, con pre-posicionamiento automático para interactuar con la barra de tareas y menús en Windows 11.
-   - **Editor visual de pasos** (borrar pasos, insertar pausas manuales y ajustar esperas).
-   - **Biblioteca rápida** de macros guardadas en `macros/*.json`, control de velocidad (`0.5x`–`2x`), repeticiones o bucle infinito y liberación garantizada de teclas/botones al detener.
+   - Grabación selectiva de **Teclado**, **Mouse (Clicks/Scroll)** y **Movimientos** mediante hook Win32 `WH_MOUSE_LL` asíncrono de baja latencia, conservando automáticamente la espera final al detener la grabación como paso `[PAUSA]` editable.
+   - Emisión nativa Win32 (`SendInput` con código virtual + *scan code* real y pulso mínimo compatible con juegos a 60 FPS / cursor bloqueado) y pre-posicionamiento automático para la barra de tareas y menús en Windows 11.
+   - **Editor visual de pasos** (borrar pasos, insertar pausas manuales y ajustar esperas directamente).
+   - **Biblioteca rápida** de macros guardadas en `macros/*.json`, control de velocidad (`0.5x`–`2x`), repeticiones o bucle infinito con pausa entre ciclos y liberación garantizada de teclas/botones al detener.
 4. **⏱ Límites y Seguridad**
    - **Parada automática** por cantidad de ciclos o minutos.
    - **Cuenta regresiva** configurable antes de iniciar.
