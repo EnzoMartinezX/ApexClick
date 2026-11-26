@@ -14,9 +14,12 @@ from win_utils import (
     get_cursor_pos_win32,
     get_foreground_window_title,
     is_in_failsafe_corner,
+    resolve_char_to_vk,
     send_atomic_press_at,
     send_atomic_release_at,
     send_atomic_zones_click,
+    send_key_vk,
+    send_mouse_button,
 )
 
 
@@ -112,6 +115,28 @@ def format_short_total(seconds: float) -> str:
     return f"{mins}m {rem:.1f}s"
 
 
+def resolve_key_to_vk(key: Union[Key, KeyCode]) -> Tuple[Optional[int], Optional[bool]]:
+    """Resolve a pynput Key or KeyCode to a physical Win32 (vk, extended) pair."""
+    if isinstance(key, Key):
+        val = key.value
+        vk = getattr(val, "vk", None)
+        if vk is not None:
+            raw_flags = getattr(val, "_flags", None)
+            ext = bool(raw_flags & 0x0001) if raw_flags is not None else None
+            return int(vk), ext
+        return None, None
+    if isinstance(key, KeyCode):
+        if key.vk is not None:
+            raw_flags = getattr(key, "_flags", None)
+            ext = bool(raw_flags & 0x0001) if raw_flags is not None else None
+            return int(key.vk), ext
+        if key.char:
+            vk = resolve_char_to_vk(key.char)
+            if vk is not None:
+                return vk, False
+    return None, None
+
+
 def normalize_captured_key(key: Union[Key, KeyCode]) -> Tuple[Union[Key, KeyCode], str]:
     """Normalize a pynput key event into a controllable key object and display label."""
     if isinstance(key, Key):
@@ -123,9 +148,8 @@ def normalize_captured_key(key: Union[Key, KeyCode]) -> Tuple[Union[Key, KeyCode
     char = getattr(key, "char", None)
     vk = getattr(key, "vk", None)
 
-    if char and len(char) == 1 and char.isprintable() and not char.isspace():
-        return KeyCode.from_char(char.lower()), char.upper()
-
+    # Check standard alphanumeric physical VKs first so SHIFT+1 ('!') or CTRL+W ('\x17')
+    # always normalize to the same underlying physical key as the unmodified press/release.
     if vk is not None:
         if 65 <= vk <= 90:
             ch = chr(vk)
@@ -136,6 +160,11 @@ def normalize_captured_key(key: Union[Key, KeyCode]) -> Tuple[Union[Key, KeyCode
         if 96 <= vk <= 105:
             digit = vk - 96
             return KeyCode.from_vk(vk), f"NUM {digit}"
+
+    if char and len(char) == 1 and char.isprintable() and not char.isspace():
+        return KeyCode.from_char(char.lower()), char.upper()
+
+    if vk is not None:
         return KeyCode.from_vk(vk), f"TECLA {vk}"
 
     return key, str(key).upper()
@@ -143,13 +172,22 @@ def normalize_captured_key(key: Union[Key, KeyCode]) -> Tuple[Union[Key, KeyCode
 
 def serialize_key(key: Union[Key, KeyCode]) -> Dict[str, Any]:
     key_obj, label = normalize_captured_key(key)
+    vk, _ = resolve_key_to_vk(key)
+    if vk is None:
+        vk, _ = resolve_key_to_vk(key_obj)
     if isinstance(key_obj, Key):
-        return {"type": "special", "name": key_obj.name, "label": label}
+        out: Dict[str, Any] = {"type": "special", "name": key_obj.name, "label": label}
+        if vk is not None:
+            out["vk"] = int(vk)
+        return out
     if isinstance(key_obj, KeyCode):
         if key_obj.char:
-            return {"type": "char", "value": key_obj.char, "label": label}
+            out = {"type": "char", "value": key_obj.char, "label": label}
+            if vk is not None:
+                out["vk"] = int(vk)
+            return out
         if key_obj.vk is not None:
-            return {"type": "vk", "value": int(key_obj.vk), "label": label}
+            return {"type": "vk", "value": int(key_obj.vk), "label": label, "vk": int(key_obj.vk)}
     return {"type": "char", "value": str(key_obj), "label": label}
 
 
@@ -250,7 +288,8 @@ class ClickerEngine:
     MIN_INTERVAL_SEC = 0.01
     MIN_HOLD_SEC = 0.02
     MIN_WAIT_GAP_SEC = 0.02
-    KEY_TAP_SEC = 0.02
+    KEY_TAP_SEC = 0.025
+    MOUSE_TAP_SEC = 0.025
     MULTI_CLICK_GAP_SEC = 0.015
 
     def __init__(
@@ -265,6 +304,7 @@ class ClickerEngine:
         use_atomic_win32: Optional[bool] = None,
     ):
         self._using_default_mouse = mouse_controller is None
+        self._using_default_keyboard = keyboard_controller is None
         self._mouse = mouse_controller or MouseController()
         self._keyboard = keyboard_controller or KeyboardController()
         self._clock = clock
@@ -272,8 +312,9 @@ class ClickerEngine:
         self._target_zones_provider = target_zones_provider
         self._foreground_title_provider = foreground_title_provider or get_foreground_window_title
         self._on_finished = on_finished
-        # Use atomic Win32 SendInput by default on real mouse; mock controllers use controller API
+        # Use atomic Win32 SendInput by default on real mouse/keyboard; mocks use controller API
         self._use_atomic_win32 = self._using_default_mouse if use_atomic_win32 is None else use_atomic_win32
+        self._use_native_vk = self._using_default_keyboard if use_atomic_win32 is None else use_atomic_win32
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -388,17 +429,31 @@ class ClickerEngine:
         except Exception:
             pass
 
+    def _emit_key_unlocked(self, k: Union[Key, KeyCode], is_press: bool) -> None:
+        if self._use_native_vk:
+            vk, ext = resolve_key_to_vk(k)
+            if vk is not None:
+                send_key_vk(vk, is_press, extended=ext)
+                return
+        if is_press:
+            self._keyboard.press(k)
+        else:
+            self._keyboard.release(k)
+
     def _press(self, config: ClickerConfig) -> None:
         with self._lock:
             if self._is_pressed:
                 return
             if config.input_type == "mouse":
-                self._mouse.press(config.mouse_button)
+                if self._use_atomic_win32:
+                    send_mouse_button(MOUSE_BTN_TO_STR.get(config.mouse_button, "left"), True)
+                else:
+                    self._mouse.press(config.mouse_button)
                 self._is_pressed = True
             else:
                 keys = config.resolved_keys()
                 for k in keys:
-                    self._keyboard.press(k)
+                    self._emit_key_unlocked(k, True)
                     self._pressed_keys.append(k)
                 self._is_pressed = True
 
@@ -408,12 +463,15 @@ class ClickerEngine:
         try:
             if config.input_type == "mouse":
                 if self._is_pressed:
-                    self._mouse.release(config.mouse_button)
+                    if self._use_atomic_win32:
+                        send_mouse_button(MOUSE_BTN_TO_STR.get(config.mouse_button, "left"), False)
+                    else:
+                        self._mouse.release(config.mouse_button)
             else:
                 # Release in reverse order (main key first, then modifiers)
                 for k in reversed(self._pressed_keys):
                     try:
-                        self._keyboard.release(k)
+                        self._emit_key_unlocked(k, False)
                     except Exception:
                         pass
                 self._pressed_keys.clear()
@@ -509,10 +567,23 @@ class ClickerEngine:
 
     def _do_multi_click(self, config: ClickerConfig) -> None:
         count = max(1, min(3, config.click_count))
+        btn_name = MOUSE_BTN_TO_STR.get(config.mouse_button, "left")
+        tap_sec = min(self.MOUSE_TAP_SEC, max(0.004, config.interval_seconds / 2.0))
         for i in range(count):
             if self._stop_event.is_set():
                 return
-            self._mouse.click(config.mouse_button)
+            if self._use_atomic_win32:
+                send_mouse_button(btn_name, True)
+                with self._lock:
+                    self._is_pressed = True
+                try:
+                    self._stop_event.wait(tap_sec)
+                finally:
+                    send_mouse_button(btn_name, False)
+                    with self._lock:
+                        self._is_pressed = False
+            else:
+                self._mouse.click(config.mouse_button)
             if i < count - 1:
                 self._stop_event.wait(self.MULTI_CLICK_GAP_SEC)
 

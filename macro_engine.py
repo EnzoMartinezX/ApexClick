@@ -14,10 +14,18 @@ from engine import (
     MOUSE_BUTTON_NAMES,
     deserialize_key as _deserialize_key_pair,
     normalize_captured_key,
+    resolve_key_to_vk,
     same_key,
     serialize_key,
 )
-from win_utils import send_atomic_move
+from win_utils import (
+    FastMouseHook,
+    get_cursor_pos_win32,
+    send_atomic_move,
+    send_key_vk,
+    send_mouse_button,
+    send_mouse_scroll,
+)
 
 
 BUTTON_STR_TO_ENUM = {
@@ -35,6 +43,9 @@ def deserialize_key(data: Dict[str, Any]) -> Optional[Union[Key, KeyCode]]:
 
 
 def _key_identity(key: Union[Key, KeyCode]) -> Tuple[str, Any]:
+    vk, _ = resolve_key_to_vk(key)
+    if vk is not None:
+        return ("vk", int(vk))
     norm, _ = normalize_captured_key(key)
     if isinstance(norm, Key):
         return ("special", norm.name)
@@ -203,7 +214,7 @@ class MacroRecorder:
         self._last_move_pos: Optional[Tuple[int, int]] = None
 
         self._kb_listener: Optional[keyboard.Listener] = None
-        self._mouse_listener: Optional[mouse.Listener] = None
+        self._mouse_listener: Optional[Any] = None
 
     @property
     def recording(self) -> bool:
@@ -247,12 +258,13 @@ class MacroRecorder:
                 self._kb_listener.start()
 
             if record_mouse_clicks or record_mouse_moves:
-                self._mouse_listener = mouse.Listener(
-                    on_move=self.handle_mouse_move if record_mouse_moves else None,
+                self._mouse_listener = FastMouseHook(
                     on_click=self.handle_mouse_click if record_mouse_clicks else None,
+                    on_move=self.handle_mouse_move if record_mouse_moves else None,
                     on_scroll=self.handle_mouse_scroll if record_mouse_clicks else None,
+                    record_moves=record_mouse_moves,
+                    clock=self._clock,
                 )
-                self._mouse_listener.daemon = True
                 self._mouse_listener.start()
 
         return True
@@ -333,10 +345,17 @@ class MacroRecorder:
                 return
             self._append_unlocked("key_up", kdata, now)
 
-    def handle_mouse_click(self, x: int, y: int, button: Button, pressed: bool) -> None:
-        now = self._clock()
-        btn_name = BUTTON_ENUM_TO_STR.get(button)
-        if btn_name is None:
+    def handle_mouse_click(
+        self,
+        x: int,
+        y: int,
+        button: Union[Button, str],
+        pressed: bool,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        now = self._clock() if timestamp is None else timestamp
+        btn_name = button if isinstance(button, str) else BUTTON_ENUM_TO_STR.get(button)
+        if btn_name not in BUTTON_STR_TO_ENUM:
             return
         with self._lock:
             if not self._recording or not self._record_mouse_clicks:
@@ -351,8 +370,8 @@ class MacroRecorder:
                 self._held_buttons.pop(btn_name, None)
                 self._append_unlocked("mouse_up", {"button": btn_name, "x": ix, "y": iy}, now)
 
-    def handle_mouse_move(self, x: int, y: int) -> None:
-        now = self._clock()
+    def handle_mouse_move(self, x: int, y: int, timestamp: Optional[float] = None) -> None:
+        now = self._clock() if timestamp is None else timestamp
         with self._lock:
             if not self._recording or not self._record_mouse_moves:
                 return
@@ -366,8 +385,15 @@ class MacroRecorder:
             self._last_move_pos = (ix, iy)
             self._append_unlocked("mouse_move", {"x": ix, "y": iy}, now)
 
-    def handle_mouse_scroll(self, x: int, y: int, dx: int, dy: int) -> None:
-        now = self._clock()
+    def handle_mouse_scroll(
+        self,
+        x: int,
+        y: int,
+        dx: int,
+        dy: int,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        now = self._clock() if timestamp is None else timestamp
         with self._lock:
             if not self._recording or not self._record_mouse_clicks:
                 return
@@ -401,7 +427,10 @@ class MacroSnapshot:
 
 
 class MacroPlayer:
-    """Plays recorded MacroEvents cleanly with guaranteed key & button release on stop."""
+    """Plays recorded MacroEvents cleanly with native Win32 game-safe input & guaranteed release."""
+
+    # Minimum press duration for real mouse clicks so 60 FPS games never drop quick taps
+    MIN_REAL_CLICK_HOLD_SEC = 0.028
 
     def __init__(
         self,
@@ -409,8 +438,12 @@ class MacroPlayer:
         keyboard_controller: Optional[KeyboardController] = None,
         clock: Callable[[], float] = time.perf_counter,
         on_finished: Optional[Callable[[], None]] = None,
+        use_native_win32: Optional[bool] = None,
     ):
         self._using_default_mouse = mouse_controller is None
+        self._using_default_keyboard = keyboard_controller is None
+        self._use_native_mouse = self._using_default_mouse if use_native_win32 is None else use_native_win32
+        self._use_native_kb = self._using_default_keyboard if use_native_win32 is None else use_native_win32
         self._mouse = mouse_controller or MouseController()
         self._keyboard = keyboard_controller or KeyboardController()
         self._clock = clock
@@ -428,11 +461,14 @@ class MacroPlayer:
         self._infinite = False
         self._loop_start = 0.0
         self._total_duration = 0.0
+        self._phase_duration = 0.0
         self._event_index = 0
         self._total_events = 0
 
-        self._active_keys: Dict[Tuple[str, Any], Union[Key, KeyCode]] = {}
+        self._active_keys: Dict[Tuple[str, Any], Tuple[Union[Key, KeyCode], Optional[int], Optional[bool]]] = {}
         self._active_buttons: Set[Button] = set()
+        self._mouse_down_pos: Dict[str, Tuple[int, int]] = {}
+        self._mouse_down_ts: Dict[str, float] = {}
 
     @property
     def running(self) -> bool:
@@ -443,7 +479,8 @@ class MacroPlayer:
         if not events:
             return False
         speed = max(0.1, min(10.0, config.speed))
-        summary = summarize_events(events)
+        copied_events = sorted(list(events), key=lambda e: e.time_offset)
+        summary = summarize_events(copied_events)
         total_dur = summary["duration"] / speed
         with self._lock:
             if self._running:
@@ -456,16 +493,18 @@ class MacroPlayer:
             self._infinite = config.infinite_loop
             self._loop_start = self._clock()
             self._total_duration = total_dur
+            self._phase_duration = total_dur
             self._event_index = 0
-            self._total_events = len(events)
+            self._total_events = len(copied_events)
             self._active_keys.clear()
             self._active_buttons.clear()
+            self._mouse_down_pos.clear()
+            self._mouse_down_ts.clear()
             self._stop_event.clear()
 
-        copied_events = list(events)
         self._thread = threading.Thread(
             target=self._run,
-            args=(copied_events, config, speed),
+            args=(copied_events, config, speed, total_dur),
             daemon=True,
         )
         self._thread.start()
@@ -484,8 +523,9 @@ class MacroPlayer:
     def get_snapshot(self) -> MacroSnapshot:
         with self._lock:
             elapsed = max(0.0, self._clock() - self._loop_start) if self._running else 0.0
-            if self._total_duration > 0.0:
-                elapsed = min(elapsed, self._total_duration)
+            dur = self._phase_duration if self._phase_duration > 0.0 else self._total_duration
+            if dur > 0.0:
+                elapsed = min(elapsed, dur)
             return MacroSnapshot(
                 running=self._running,
                 phase=self._phase,
@@ -494,25 +534,45 @@ class MacroPlayer:
                 total_loops=self._total_loops,
                 infinite=self._infinite,
                 elapsed=elapsed,
-                total_duration=self._total_duration,
+                total_duration=dur,
                 event_index=self._event_index,
                 total_events=self._total_events,
             )
 
+    def _emit_key_unlocked(
+        self,
+        key_obj: Union[Key, KeyCode],
+        vk: Optional[int],
+        ext: Optional[bool],
+        is_press: bool,
+    ) -> None:
+        if self._use_native_kb and vk is not None:
+            send_key_vk(vk, is_press, extended=ext)
+            return
+        if is_press:
+            self._keyboard.press(key_obj)
+        else:
+            self._keyboard.release(key_obj)
+
     def _release_all_unlocked(self) -> None:
-        for key_obj in list(self._active_keys.values()):
+        for key_obj, vk, ext in list(self._active_keys.values()):
             try:
-                self._keyboard.release(key_obj)
+                self._emit_key_unlocked(key_obj, vk, ext, False)
             except Exception:
                 pass
         self._active_keys.clear()
 
         for btn in list(self._active_buttons):
             try:
-                self._mouse.release(btn)
+                if self._use_native_mouse:
+                    send_mouse_button(BUTTON_ENUM_TO_STR.get(btn, "left"), False)
+                else:
+                    self._mouse.release(btn)
             except Exception:
                 pass
         self._active_buttons.clear()
+        self._mouse_down_pos.clear()
+        self._mouse_down_ts.clear()
 
     def _wait_until(self, deadline: float) -> bool:
         while not self._stop_event.is_set():
@@ -522,6 +582,19 @@ class MacroPlayer:
             self._stop_event.wait(min(0.015, rem))
         return True
 
+    def _resolve_event_vk(
+        self,
+        ev_data: Dict[str, Any],
+        key_obj: Union[Key, KeyCode],
+    ) -> Tuple[Optional[int], Optional[bool]]:
+        vk, ext = resolve_key_to_vk(key_obj)
+        if vk is None and ev_data.get("vk") is not None:
+            try:
+                vk = int(ev_data["vk"])
+            except Exception:
+                vk = None
+        return vk, ext
+
     def _dispatch_event(self, ev: MacroEvent) -> None:
         if ev.kind == "pause":
             return
@@ -529,35 +602,73 @@ class MacroPlayer:
             key_obj = deserialize_key(ev.data)
             if key_obj is not None:
                 ident = _key_identity(key_obj)
+                vk, ext = self._resolve_event_vk(ev.data, key_obj)
                 with self._lock:
-                    self._keyboard.press(key_obj)
-                    self._active_keys[ident] = key_obj
+                    self._emit_key_unlocked(key_obj, vk, ext, True)
+                    self._active_keys[ident] = (key_obj, vk, ext)
         elif ev.kind == "key_up":
             key_obj = deserialize_key(ev.data)
             if key_obj is not None:
                 ident = _key_identity(key_obj)
+                vk, ext = self._resolve_event_vk(ev.data, key_obj)
                 with self._lock:
-                    self._keyboard.release(key_obj)
+                    self._emit_key_unlocked(key_obj, vk, ext, False)
                     self._active_keys.pop(ident, None)
         elif ev.kind == "mouse_move":
-            self._mouse.position = (int(ev.data["x"]), int(ev.data["y"]))
+            x, y = int(ev.data["x"]), int(ev.data["y"])
+            if self._use_native_mouse:
+                send_atomic_move(x, y)
+            else:
+                self._mouse.position = (x, y)
         elif ev.kind == "mouse_down":
-            btn = BUTTON_STR_TO_ENUM.get(ev.data.get("button", "left"), Button.left)
-            self._mouse.position = (int(ev.data["x"]), int(ev.data["y"]))
-            with self._lock:
-                self._mouse.press(btn)
-                self._active_buttons.add(btn)
+            btn_name = ev.data.get("button", "left")
+            btn = BUTTON_STR_TO_ENUM.get(btn_name, Button.left)
+            x, y = int(ev.data["x"]), int(ev.data["y"])
+            if self._use_native_mouse:
+                cur = get_cursor_pos_win32()
+                if cur is not None and (abs(cur[0] - x) > 2 or abs(cur[1] - y) > 2):
+                    send_atomic_move(x, y)
+                with self._lock:
+                    send_mouse_button(btn_name, True)
+                    self._active_buttons.add(btn)
+                    self._mouse_down_pos[btn_name] = (x, y)
+                    self._mouse_down_ts[btn_name] = self._clock()
+            else:
+                self._mouse.position = (x, y)
+                with self._lock:
+                    self._mouse.press(btn)
+                    self._active_buttons.add(btn)
         elif ev.kind == "mouse_up":
-            btn = BUTTON_STR_TO_ENUM.get(ev.data.get("button", "left"), Button.left)
-            self._mouse.position = (int(ev.data["x"]), int(ev.data["y"]))
-            with self._lock:
-                self._mouse.release(btn)
-                self._active_buttons.discard(btn)
+            btn_name = ev.data.get("button", "left")
+            btn = BUTTON_STR_TO_ENUM.get(btn_name, Button.left)
+            x, y = int(ev.data["x"]), int(ev.data["y"])
+            if self._use_native_mouse:
+                down_pos = self._mouse_down_pos.pop(btn_name, None)
+                self._mouse_down_ts.pop(btn_name, None)
+                # Only reposition before release if this was an actual drag (>2px)
+                if down_pos is not None and (abs(down_pos[0] - x) > 2 or abs(down_pos[1] - y) > 2):
+                    send_atomic_move(x, y)
+                with self._lock:
+                    send_mouse_button(btn_name, False)
+                    self._active_buttons.discard(btn)
+            else:
+                self._mouse.position = (x, y)
+                with self._lock:
+                    self._mouse.release(btn)
+                    self._active_buttons.discard(btn)
         elif ev.kind == "mouse_scroll":
-            self._mouse.position = (int(ev.data["x"]), int(ev.data["y"]))
-            self._mouse.scroll(int(ev.data.get("dx", 0)), int(ev.data.get("dy", 0)))
+            x, y = int(ev.data["x"]), int(ev.data["y"])
+            dx, dy = int(ev.data.get("dx", 0)), int(ev.data.get("dy", 0))
+            if self._use_native_mouse:
+                cur = get_cursor_pos_win32()
+                if cur is None or abs(cur[0] - x) > 2 or abs(cur[1] - y) > 2:
+                    send_atomic_move(x, y)
+                send_mouse_scroll(dx, dy)
+            else:
+                self._mouse.position = (x, y)
+                self._mouse.scroll(dx, dy)
 
-    def _run(self, events: List[MacroEvent], config: MacroPlayConfig, speed: float) -> None:
+    def _run(self, events: List[MacroEvent], config: MacroPlayConfig, speed: float, total_dur: float) -> None:
         try:
             loop_num = 0
             while not self._stop_event.is_set():
@@ -570,26 +681,39 @@ class MacroPlayer:
                     self._current_loop = loop_num
                     self._phase = "REPRODUCIENDO"
                     self._loop_start = loop_start
+                    self._phase_duration = total_dur
                     self._event_index = 0
+                    self._mouse_down_pos.clear()
+                    self._mouse_down_ts.clear()
 
                 prev_kind: Optional[str] = None
                 for idx, ev in enumerate(events):
                     target_time = loop_start + (ev.time_offset / speed)
-                    # When playing clicks without recorded mouse_move, pre-position via
-                    # SendInput ~25ms ahead so Windows 11 taskbar & hover UIs register hover
-                    # before mouse_down without shifting click timing!
-                    if (
-                        self._using_default_mouse
-                        and ev.kind == "mouse_down"
-                        and prev_kind != "mouse_move"
-                    ):
-                        pre_time = target_time - 0.025
-                        if pre_time > self._clock():
-                            if self._wait_until(pre_time):
+                    # Smart pre-hover for clicks without recorded moves:
+                    # - If cursor is elsewhere (desktop/taskbar/game menu), pre-move 25ms ahead.
+                    # - If cursor is already on target (e.g. cursor-locked 3D game), skip move!
+                    if self._use_native_mouse and ev.kind == "mouse_down" and prev_kind != "mouse_move":
+                        tx, ty = int(ev.data["x"]), int(ev.data["y"])
+                        cur = get_cursor_pos_win32()
+                        needs_move = cur is None or abs(cur[0] - tx) > 2 or abs(cur[1] - ty) > 2
+                        if needs_move:
+                            pre_time = target_time - 0.025
+                            if pre_time > self._clock():
+                                if self._wait_until(pre_time):
+                                    return
+                            send_atomic_move(tx, ty)
+                            min_hover_until = max(target_time, self._clock() + 0.015)
+                            if self._wait_until(min_hover_until):
                                 return
-                        send_atomic_move(int(ev.data["x"]), int(ev.data["y"]))
-                        min_hover_until = max(target_time, self._clock() + 0.015)
-                        if self._wait_until(min_hover_until):
+                        else:
+                            if self._wait_until(target_time):
+                                return
+                    elif self._use_native_mouse and ev.kind == "mouse_up":
+                        # Guarantee minimum press duration (~28ms) so 60 FPS games never drop quick clicks
+                        btn_name = ev.data.get("button", "left")
+                        down_ts = self._mouse_down_ts.get(btn_name)
+                        min_up = (down_ts + self.MIN_REAL_CLICK_HOLD_SEC) if down_ts is not None else 0.0
+                        if self._wait_until(max(target_time, min_up)):
                             return
                     else:
                         if self._wait_until(target_time):
@@ -615,6 +739,7 @@ class MacroPlayer:
                     with self._lock:
                         self._phase = "PAUSA ENTRE CICLOS"
                         self._loop_start = pause_start
+                        self._phase_duration = config.loop_delay
                     if self._wait_until(pause_start + config.loop_delay):
                         return
         finally:
@@ -622,6 +747,7 @@ class MacroPlayer:
                 self._release_all_unlocked()
                 self._running = False
                 self._phase = "LISTO"
+                self._phase_duration = total_dur
             if self._on_finished is not None:
                 try:
                     self._on_finished()

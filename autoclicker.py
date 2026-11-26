@@ -484,6 +484,7 @@ class AutoclickerApp(ctk.CTk):
         # Capture & Timers
         self.capturing_mode: Optional[str] = None
         self._held_modifiers: List[Key] = []
+        self._held_hotkeys: set = set()
         self._pending_start_after: Optional[str] = None
         self._pending_macro_after: Optional[str] = None
         self._hud_after_id: Optional[str] = None
@@ -2204,18 +2205,33 @@ class AutoclickerApp(ctk.CTk):
             return
 
         if same_key(key, self.hotkey_macro_record):
+            if "rec" in self._held_hotkeys:
+                return
+            self._held_hotkeys.add("rec")
             self.after(0, lambda: self.toggle_macro_recording(from_button=False))
             return
         if same_key(key, self.hotkey_macro_play):
+            if "play" in self._held_hotkeys:
+                return
+            self._held_hotkeys.add("play")
             self.after(0, self.toggle_macro_playback)
             return
         if same_key(key, self.hotkey_clicker):
+            if "clicker" in self._held_hotkeys:
+                return
+            self._held_hotkeys.add("clicker")
             self.after(0, self.toggle_clicking)
 
     def _on_global_key_release(self, key: Union[Key, KeyCode]) -> None:
         mod = _canonical_modifier(key)
         if mod is not None and mod in self._held_modifiers:
             self._held_modifiers.remove(mod)
+        if same_key(key, self.hotkey_macro_record):
+            self._held_hotkeys.discard("rec")
+        if same_key(key, self.hotkey_macro_play):
+            self._held_hotkeys.discard("play")
+        if same_key(key, self.hotkey_clicker):
+            self._held_hotkeys.discard("clicker")
 
     def _reset_capture_buttons(self) -> None:
         self.btn_capture_key.configure(text=self._t("capture_key_btn"), fg_color=COLORS["neon_dim"], text_color=COLORS["neon_cyan"])
@@ -2430,7 +2446,7 @@ class AutoclickerApp(ctk.CTk):
             self._start_macro_recording(from_button=from_button)
 
     def _start_macro_recording(self, from_button: bool = False) -> None:
-        if self.macro_recorder.recording:
+        if self.macro_recorder.recording or self._pending_macro_after is not None:
             return
         if self.engine.running:
             self.stop_clicking()
@@ -2483,7 +2499,7 @@ class AutoclickerApp(ctk.CTk):
             self.start_macro_playback(from_button=False)
 
     def start_macro_playback(self, from_button: bool = False) -> None:
-        if self.macro_player.running or self.macro_recorder.recording:
+        if self.macro_player.running or self.macro_recorder.recording or self._pending_macro_after is not None:
             return
         if not self.macro_events:
             self.label_macro_footer.configure(text=self._t("macro_need_events"), text_color=COLORS["danger"])
@@ -2496,7 +2512,12 @@ class AutoclickerApp(ctk.CTk):
         except ValueError:
             repeats = 1
         try:
-            delay = max(0.0, float(self.entry_macro_delay.get().strip().replace(",", ".")))
+            raw_delay = self.entry_macro_delay.get().strip().lower().replace(",", ".")
+            for suffix in ("seg", "sec", "s"):
+                if raw_delay.endswith(suffix):
+                    raw_delay = raw_delay[: -len(suffix)].strip()
+                    break
+            delay = max(0.0, float(raw_delay))
         except ValueError:
             delay = 0.5
         try:
