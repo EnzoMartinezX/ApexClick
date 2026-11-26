@@ -2600,7 +2600,7 @@ class AutoclickerApp(ctk.CTk):
         if self.macro_recorder.recording or self.macro_player.running:
             return
         idx = self._get_selected_step_index()
-        if idx is None or idx == 0:
+        if idx is None or (idx == 0 and self.macro_events[0].kind != "pause"):
             self.label_macro_footer.configure(text=self._t("macro_pick_delay"), text_color=COLORS["warn_amber"])
             return
         sec = self._parse_step_seconds()
@@ -2821,11 +2821,13 @@ class AutoclickerApp(ctk.CTk):
             mini_counter = f"{rec_count} ev"
         elif msnap.running:
             loc_mphase = translate_engine_phase(self.lang, msnap.phase)
-            self.macro_hud_card.configure(border_color=COLORS["neon_cyan"])
-            self.label_macro_phase.configure(text=f"●  {loc_mphase}", text_color=COLORS["neon_cyan"])
+            is_loop_pause = msnap.phase == "PAUSA ENTRE CICLOS"
+            m_accent = COLORS["accent_sky"] if is_loop_pause else COLORS["neon_cyan"]
+            self.macro_hud_card.configure(border_color=COLORS["border_blue"] if is_loop_pause else COLORS["neon_cyan"])
+            self.label_macro_phase.configure(text=f"●  {loc_mphase}", text_color=m_accent)
             self.label_macro_clock.configure(
                 text=f"{format_timer(msnap.elapsed)} / {format_timer(msnap.total_duration)}",
-                text_color=COLORS["neon_cyan"],
+                text_color=m_accent,
             )
             if msnap.infinite:
                 l_txt = f"✓ {msnap.completed_loops} (∞)"
@@ -2834,9 +2836,10 @@ class AutoclickerApp(ctk.CTk):
                 l_txt = f"{msnap.current_loop}/{msnap.total_loops}"
                 mini_counter = f"{msnap.current_loop}/{msnap.total_loops}"
             self.label_macro_counters.configure(text=self._t("step_fmt", i=msnap.event_index, t=msnap.total_events, l=l_txt))
-            self.macro_progress.configure(progress_color=COLORS["neon_cyan"])
+            self.macro_progress.configure(progress_color=COLORS["neon_blue"] if is_loop_pause else COLORS["neon_cyan"])
             self.macro_progress.set(min(1.0, msnap.elapsed / msnap.total_duration) if msnap.total_duration > 0 else 1.0)
-            mini_phase, mini_time, mini_active, mini_accent = self._t("mini_macro"), format_timer(msnap.elapsed), True, COLORS["neon_cyan"]
+            mini_phase = self._t("mini_waiting") if is_loop_pause else self._t("mini_macro")
+            mini_time, mini_active, mini_accent = format_timer(msnap.elapsed), True, m_accent
         else:
             stats = summarize_events(self.macro_events)
             self.macro_hud_card.configure(border_color=COLORS["border"])

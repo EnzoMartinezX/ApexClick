@@ -128,25 +128,43 @@ def insert_pause_after(events: Sequence[MacroEvent], index: int, pause_sec: floa
     if not lst:
         return [MacroEvent(0.0, "pause", {"seconds": sec})]
     idx = max(0, min(index, len(lst) - 1))
-    pause_t = lst[idx].time_offset
+    prev_ev = lst[idx]
+    prev_extra = max(0.0, float(prev_ev.data.get("seconds", 0.0))) if prev_ev.kind == "pause" else 0.0
+    pause_t = round(prev_ev.time_offset + prev_extra, 4)
     out: List[MacroEvent] = list(lst[: idx + 1])
-    out.append(MacroEvent(round(pause_t, 4), "pause", {"seconds": sec}))
+    out.append(MacroEvent(pause_t, "pause", {"seconds": sec}))
     for ev in lst[idx + 1 :]:
         out.append(MacroEvent(round(ev.time_offset + sec, 4), ev.kind, dict(ev.data)))
     return out
 
 
 def update_step_delay(events: Sequence[MacroEvent], index: int, new_gap_sec: float) -> List[MacroEvent]:
-    """Change wait time before step `index` to `new_gap_sec`, shifting subsequent steps."""
+    """Change wait before step `index` (or update duration directly if step `index` is a pause)."""
     lst = list(events)
-    if index <= 0 or index >= len(lst):
+    if index < 0 or index >= len(lst):
         return lst
     gap = max(0.0, round(float(new_gap_sec), 4))
-    prev_t = lst[index - 1].time_offset
-    old_t = lst[index].time_offset
+    target_ev = lst[index]
+    if target_ev.kind == "pause":
+        old_sec = max(0.0, float(target_ev.data.get("seconds", 0.0)))
+        new_sec = max(0.05, round(gap, 3))
+        delta = new_sec - old_sec
+        out: List[MacroEvent] = list(lst[:index])
+        new_data = dict(target_ev.data)
+        new_data["seconds"] = new_sec
+        out.append(MacroEvent(target_ev.time_offset, "pause", new_data))
+        for ev in lst[index + 1 :]:
+            out.append(MacroEvent(round(max(0.0, ev.time_offset + delta), 4), ev.kind, dict(ev.data)))
+        return out
+    if index == 0:
+        return lst
+    prev_ev = lst[index - 1]
+    prev_extra = max(0.0, float(prev_ev.data.get("seconds", 0.0))) if prev_ev.kind == "pause" else 0.0
+    prev_t = prev_ev.time_offset + prev_extra
+    old_t = target_ev.time_offset
     new_t = prev_t + gap
     delta = new_t - old_t
-    out: List[MacroEvent] = list(lst[:index])
+    out = list(lst[:index])
     for ev in lst[index:]:
         out.append(MacroEvent(round(max(0.0, ev.time_offset + delta), 4), ev.kind, dict(ev.data)))
     return out
@@ -157,16 +175,27 @@ def summarize_events(events: Sequence[MacroEvent]) -> Dict[str, Any]:
     click_events = sum(1 for e in events if e.kind in ("mouse_down", "mouse_up", "mouse_scroll"))
     move_events = sum(1 for e in events if e.kind == "mouse_move")
     duration = 0.0
-    if events:
-        last = events[-1]
-        extra = float(last.data.get("seconds", 0.0)) if last.kind == "pause" else 0.0
-        duration = last.time_offset + extra
+    shift = 0.0
+    for i, ev in enumerate(events):
+        t = ev.time_offset + shift
+        if ev.kind == "pause":
+            sec = max(0.0, float(ev.data.get("seconds", 0.0)))
+            end_t = t + sec
+            if end_t > duration:
+                duration = end_t
+            if i + 1 < len(events):
+                next_t = events[i + 1].time_offset + shift
+                if end_t > next_t:
+                    shift += end_t - next_t
+        else:
+            if t > duration:
+                duration = t
     return {
         "total": len(events),
         "keys": key_events,
         "clicks": click_events,
         "moves": move_events,
-        "duration": duration,
+        "duration": round(duration, 4),
     }
 
 
@@ -269,7 +298,10 @@ class MacroRecorder:
 
         return True
 
+    TRAILING_PAUSE_MIN_SEC = 0.25
+
     def stop(self) -> List[MacroEvent]:
+        stop_ts = self._clock()
         kb_l = self._kb_listener
         m_l = self._mouse_listener
         self._kb_listener = None
@@ -291,15 +323,28 @@ class MacroRecorder:
                 return list(self._events)
             self._recording = False
 
-            now = self._clock()
             if self._first_ts is not None:
-                offset = max(0.0, now - self._first_ts)
+                offset = max(0.0, stop_ts - self._first_ts)
                 for _ident, kdata in list(self._held_keys.items()):
                     self._events.append(MacroEvent(offset, "key_up", dict(kdata)))
                 for btn_name, (bx, by) in list(self._held_buttons.items()):
                     self._events.append(
                         MacroEvent(offset, "mouse_up", {"button": btn_name, "x": bx, "y": by})
                     )
+                # Preserve intentional trailing wait after the last input before stopping recording
+                # (e.g. waiting for character respawn/cooldown in a game before pressing F7).
+                if self._events:
+                    last_ev = self._events[-1]
+                    last_end = last_ev.time_offset + (
+                        max(0.0, float(last_ev.data.get("seconds", 0.0)))
+                        if last_ev.kind == "pause"
+                        else 0.0
+                    )
+                    tail_wait = round(max(0.0, offset - last_end), 3)
+                    if tail_wait >= self.TRAILING_PAUSE_MIN_SEC:
+                        self._events.append(
+                            MacroEvent(round(last_end, 4), "pause", {"seconds": tail_wait})
+                        )
             self._held_keys.clear()
             self._held_buttons.clear()
             return list(self._events)
@@ -723,11 +768,20 @@ class MacroPlayer:
                     prev_kind = ev.kind
                     with self._lock:
                         self._event_index = idx + 1
-                    # If the last event is an explicit pause, honor its duration too
-                    if ev.kind == "pause" and idx == len(events) - 1:
-                        extra = float(ev.data.get("seconds", 0.0)) / speed
-                        if extra > 0 and self._wait_until(self._clock() + extra):
-                            return
+                    # Honor EVERY explicit pause step accurately (including trailing or consecutive pauses)
+                    if ev.kind == "pause":
+                        extra = max(0.0, float(ev.data.get("seconds", 0.0))) / speed
+                        if extra > 0:
+                            pause_end = target_time + extra
+                            if idx == len(events) - 1:
+                                if self._wait_until(pause_end):
+                                    return
+                            else:
+                                next_target = loop_start + (events[idx + 1].time_offset / speed)
+                                if pause_end > next_target:
+                                    if self._wait_until(pause_end):
+                                        return
+                                    loop_start += pause_end - next_target
 
                 with self._lock:
                     self._release_all_unlocked()
